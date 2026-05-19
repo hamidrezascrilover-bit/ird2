@@ -1,0 +1,113 @@
+# .github/workflows/cleanup-from-links-v3.yml
+name: 'Cleanup Files from Links.md (v3)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      cutoff_datetime:
+        description: 'Delete file sections older than this date & time. Format: "YYYY-MM-DD HH:MM"'
+        required: true
+        default: '2025-01-01 00:00'
+
+jobs:
+  cleanup-via-links-file:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ۱. دریافت کد ریپازیتوری (به صورت سریع، بدون تاریخچه کامل)
+      - name: 'Checkout repository (fast)'
+        uses: actions/checkout@v4
+        # دیگر نیازی به fetch-depth: 0 نیست، پس این مرحله بسیار سریع خواهد بود
+
+      # ۲. حذف فایل‌های قدیمی بر اساس تاریخ‌های موجود در Links.md
+      - name: 'Delete files and sections based on Links.md'
+        id: delete_step
+        run: |
+          #!/bin/bash
+          
+          LINKS_FILE="Links.md"
+          DOWNLOAD_DIR="dl"
+          TEMP_LINKS_FILE=$(mktemp) # ایجاد یک فایل موقت برای بازنویسی امن
+          CUTOFF_DATETIME="${{ github.event.inputs.cutoff_datetime }}"
+          
+          # تبدیل تاریخ ورودی به فرمت Unix timestamp برای مقایسه عددی
+          CUTOFF_TS=$(date -d "$CUTOFF_DATETIME" +%s)
+          
+          echo "Cutoff timestamp: $CUTOFF_TS ($(date -d @$CUTOFF_TS))"
+          
+          if [ ! -f "$LINKS_FILE" ]; then
+            echo "File '$LINKS_FILE' not found. Nothing to do."
+            echo "changes_made=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          DELETED_COUNT=0
+          # متغیری برای اینکه بدانیم آیا در حال خواندن یک بخش قدیمی هستیم یا نه
+          IS_OLD_SECTION=0
+
+          # فایل Links.md را خط به خط می‌خوانیم
+          while IFS= read -r line; do
+            # چک می‌کنیم آیا خط فعلی یک هدرِ تاریخ است یا نه
+            if [[ $line == "### 📅 "* ]]; then
+              # استخراج تاریخ از خط (مثلا 2026-05-06 20:07)
+              entry_date=$(echo "$line" | grep -oP '\d{4}-\d{2}-\d{2} \d{2}:\d{2}')
+              entry_ts=$(date -d "$entry_date" +%s)
+              
+              echo "Processing section with date: $entry_date (Timestamp: $entry_ts)"
+
+              # مقایسه تاریخ بخش با تاریخ ورودی کاربر
+              if [ "$entry_ts" -lt "$CUTOFF_TS" ]; then
+                echo "-> This section is OLD and will be deleted."
+                IS_OLD_SECTION=1
+              else
+                echo "-> This section is NEW and will be kept."
+                IS_OLD_SECTION=0
+              fi
+            fi
+
+            # اگر در یک بخش قدیمی بودیم
+            if [ "$IS_OLD_SECTION" -eq 1 ]; then
+              # اگر خط، یک لینک فایل بود
+              if [[ $line == *"(https://github.com"*/dl/* ]]; then
+                # استخراج نام فایل از لینک
+                filename_encoded=$(echo "$line" | sed 's|.*/dl/\(.*\)) .*|\1|')
+                # نام فایل ممکن است URL-encoded باشد، آن را decode می‌کنیم
+                filename=$(printf '%b' "${filename_encoded//%/\\x}")
+                
+                # حذف فایل فیزیکی از پوشه dl
+                if [ -f "$DOWNLOAD_DIR/$filename" ]; then
+                  echo "   - Deleting file: $filename"
+                  rm "$DOWNLOAD_DIR/$filename"
+                  DELETED_COUNT=$((DELETED_COUNT + 1))
+                else
+                  echo "   - File not found, skipping: $filename"
+                fi
+              fi
+              # چون این بخش قدیمی است، هیچ خطی از آن (نه هدر، نه لینک، نه خط خالی) به فایل جدید اضافه نمی‌شود
+            else
+              # اگر در یک بخش قدیمی نبودیم، خط فعلی را به فایل موقت اضافه می‌کنیم
+              echo "$line" >> "$TEMP_LINKS_FILE"
+            fi
+          done < "$LINKS_FILE"
+
+          if [ "$DELETED_COUNT" -gt 0 ]; then
+            echo "$DELETED_COUNT files were deleted."
+            # فایل اصلی را با نسخه تمیز شده و موقت جایگزین می‌کنیم
+            mv "$TEMP_LINKS_FILE" "$LINKS_FILE"
+            echo "changes_made=true" >> $GITHUB_OUTPUT
+          else
+            echo "No files older than the specified date were found in Links.md."
+            rm "$TEMP_LINKS_FILE" # فایل موقت را حذف می‌کنیم چون نیازی به آن نیست
+            echo "changes_made=false" >> $GITHUB_OUTPUT
+          fi
+
+
+      # ۳. کامیت و پوش کردن تغییرات در صورت وجود
+      - name: 'Commit and push changes'
+        if: steps.delete_step.outputs.changes_made == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add dl/ Links.md
+          git commit -m "chore(cleanup): Deleted files and sections from Links.md older than ${{ github.event.inputs.cutoff_datetime }}"
+          git push
